@@ -5,26 +5,151 @@ from datetime import datetime, time
 import pickle
 import os
 import hashlib
-import torch
-import torch.nn as nn
+from numba import jit
 
-class TradeMLP(nn.Module):
-    def __init__(self):
-        super(TradeMLP, self).__init__()
-        self.fc1 = nn.Linear(7, 64)
-        self.bn1 = nn.BatchNorm1d(64)
-        self.relu1 = nn.LeakyReLU(0.1)
-        self.dropout1 = nn.Dropout(0.2)
-        self.fc2 = nn.Linear(64, 32)
-        self.bn2 = nn.BatchNorm1d(32)
-        self.relu2 = nn.LeakyReLU(0.1)
-        self.out = nn.Linear(32, 2)
+@jit(nopython=True)
+def find_exit_buy_numba(headers, lowers, closes, entry_idx, target_price, stop_price):
+    n = len(headers)
+    # Start looking from the NEXT candle (entry is at close of entry_idx-1, so next bar is entry_idx)
+    # Or is entry_idx the index of the signal candle?
+    # In simulate_buy_trade: entry_price = close[entry_idx - 1].
+    # Loop starts at 'range(entry_idx, len(df))'. entry_idx is "i" from the loop, which is the signal candle index?
+    # Wait, check logic: 
+    # run_backtest calls simulate_trade(i, ...). "i" is the current candle being checked.
+    # If signal triggers at "i", we enter at Close[i]. The trade starts evolving at i+1.
+    # The original loop was `for j in range(entry_idx, len(self.df))` where entry_idx was passed as 'i'.
+    # BUT wait, simulate_buy_trade receives 'entry_idx'.
+    # Let's check 'run_backtest'. It iterates `for i in range(20, len(self.df)):`
+    # and calls `self.simulate_buy_trade(i, ...)`
+    # Inside simulate: entry_price = values[entry_idx - 1] ??? 
+    # Wait, if I call with 'i', entry_price should be Close[i].
+    # Why [entry_idx - 1]? 
+    # Ah, let's re-read simulate_buy_trade carefully.
+    
+    # Line 659: entry_price = self.df['close'].values[entry_idx - 1]
+    # This implies 'entry_idx' passed is the index where the trade IS ALREADY HAPPENING?
+    # Or is 'entry_idx' the index current loop?
+    
+    # If checking logic check_buy_conditions(i): returns true based on [i-1], [i-2]...
+    # The signal is confirmed at Close of 'i'.
+    # We enter at Close of 'i'.
+    # The trade results come from 'i+1' onwards?
+    
+    # Original loop: `for j in range(entry_idx, len(self.df))`
+    # If entry_idx is 'i', then we check High[i] and Low[i].
+    # But if we enter at Close[i], we cannot hit TP/SL at candle 'i' (unless intra-bar, but we use Close).
+    # Assuming standard backtest: Signal at Close[i], Open trade. Check limits starting i+1.
+    # But existing code does `for j in range(entry_idx, ...)`. 
+    # If entry_idx is 'i', it checks current bar 'i'.
+    # If entry is Close[i-1] (as in line 659), then checking 'i' is correct.
+    # So 'entry_idx' MUST be the index of the first candle AFTER the signal candle.
+    # Let's keep the exact logic of the original code to avoid breaking behavior.
+    # Original: entry_price = close[entry_idx-1]. Loop starts at entry_idx.
+    
+    for j in range(entry_idx, n):
+        if headers[j] >= target_price:
+            return target_price, True, j - entry_idx + 1
+        if lowers[j] <= stop_price:
+            return stop_price, False, j - entry_idx + 1
+            
+    return closes[n-1], False, n - entry_idx
 
-    def forward(self, x):
-        x = self.dropout1(self.relu1(self.bn1(self.fc1(x))))
-        x = self.relu2(self.bn2(self.fc2(x)))
-        x = self.out(x)
-        return x
+@jit(nopython=True)
+def find_exit_sell_numba(headers, lowers, closes, entry_idx, target_price, stop_price):
+    n = len(headers)
+    for j in range(entry_idx, n):
+        if lowers[j] <= target_price:
+            return target_price, True, j - entry_idx + 1
+        if headers[j] >= stop_price:
+            return stop_price, False, j - entry_idx + 1
+            
+    return closes[n-1], False, n - entry_idx
+
+@jit(nopython=True)
+def simulate_trades_batch_numba(entry_indices, directions, opens, highs, lows, closes, ranges, tp_mult, sl_mult):
+    n_trades = len(entry_indices)
+    n_candles = len(closes)
+    
+    results = np.zeros(n_trades, dtype=np.float64)
+    winners = np.zeros(n_trades, dtype=np.bool_)
+    exit_prices = np.zeros(n_trades, dtype=np.float64)
+    exit_indices = np.zeros(n_trades, dtype=np.int64)
+    exit_bars = np.zeros(n_trades, dtype=np.int64)
+    targets = np.zeros(n_trades, dtype=np.float64)
+    stops = np.zeros(n_trades, dtype=np.float64)
+    
+    for k in range(n_trades):
+        idx = entry_indices[k]
+        direction = directions[k] # 1 for Buy, -1 for Sell
+        crs = ranges[k]
+        entry_price = closes[idx-1]
+        
+        target_price = 0.0
+        stop_price = 0.0
+        
+        if direction == 1: # Buy
+            target_price = entry_price + (crs * tp_mult)
+            stop_price = entry_price - (crs * sl_mult)
+        else: # Sell
+            target_price = entry_price - (crs * tp_mult)
+            stop_price = entry_price + (crs * sl_mult)
+            
+        targets[k] = target_price
+        stops[k] = stop_price
+            
+        # Search Exit
+        # Logic copied from find_exit_buy_numba/sell
+        # To avoid function call overhead inside loop if possible, or just call them (numba inlines usually)
+        # Putting loop here for clarity
+        
+        ep = closes[n_candles-1] # Default exit at end
+        win = False
+        bars = 0
+        found = False
+        
+        for j in range(idx, n_candles):
+            if direction == 1: # Buy
+                if highs[j] >= target_price:
+                    ep = target_price
+                    win = True
+                    bars = j - idx + 1
+                    found = True
+                    break
+                if lows[j] <= stop_price:
+                    ep = stop_price
+                    win = False
+                    bars = j - idx + 1
+                    found = True
+                    break
+            else: # Sell
+                if lows[j] <= target_price:
+                    ep = target_price
+                    win = True
+                    bars = j - idx + 1
+                    found = True
+                    break
+                if highs[j] >= stop_price:
+                    ep = stop_price
+                    win = False
+                    bars = j - idx + 1
+                    found = True
+                    break
+        
+        if not found:
+            bars = n_candles - idx
+            
+        exit_prices[k] = ep
+        winners[k] = win
+        exit_indices[k] = idx + bars - 1 # approximate
+        exit_bars[k] = bars
+        
+        if direction == 1:
+            results[k] = ep - entry_price
+        else:
+            results[k] = entry_price - ep
+            
+    return results, winners, exit_prices, exit_bars, targets, stops
+
 
 class StrategyAnalyzer:
     # Proporções disponíveis para Take x Stop
@@ -38,12 +163,12 @@ class StrategyAnalyzer:
         {'tp': 4, 'sl': 1, 'label': 'TP 4x : SL 1x'},
     ]
     
-    def __init__(self, data_file, target_points=50, stop_points=50, strategy_type='inside_bar'):
+    def __init__(self, data_file, target_points=50, stop_points=50, strategy_type='inside_bar', data_frame=None):
         self.data_file = data_file
         self.target_points = target_points
         self.stop_points = stop_points
         self.strategy_type = strategy_type
-        self.df = None
+        self.df = data_frame
         self.signals = []
         self.all_trades_df = pd.DataFrame() 
         self.current_ratio = '1:2'
@@ -52,82 +177,85 @@ class StrategyAnalyzer:
         self.filtered_df = pd.DataFrame()
         self._filtered_df = None
         
-        # AI Init
-        self.ai_model = None
-        self.ai_device = torch.device('cpu')
-        self.load_ai_model()
-
-    def load_ai_model(self):
-        try:
-            model_path = "trade_mlp.pth"
-            if os.path.exists(model_path):
-                self.ai_model = TradeMLP().to(self.ai_device)
-                self.ai_model.load_state_dict(torch.load(model_path, map_location=self.ai_device, weights_only=False))
-                self.ai_model.eval()
-                print("StrategyAnalyzer: AI Model loaded successfully.")
-            else:
-                print("StrategyAnalyzer: AI Model not found. Running without AI filter.")
-        except Exception as e:
-            print(f"StrategyAnalyzer: Error loading AI model: {e}")
-            self.ai_model = None
-        
     def _get_cache_filename(self):
         """Gera um nome de arquivo único para o cache baseado no arquivo de dados e na estratégia"""
         if not os.path.exists('.cache'):
             os.makedirs('.cache', exist_ok=True)
 
         
-        hasher = hashlib.md5()
-        with open(self.data_file, 'rb') as f:
-            buf = f.read(65536)
-            while len(buf) > 0:
-                hasher.update(buf)
-                buf = f.read(65536)
-        file_hash = hasher.hexdigest()
+        if not os.path.exists('.cache'):
+            os.makedirs('.cache', exist_ok=True)
+            
+        # Optimization: Use file modification time and size instead of reading content hash
+        # This is orders of magnitude faster for large files (like 500MB+)
+        stat = os.stat(self.data_file)
+        file_hash = f"{stat.st_mtime}_{stat.st_size}"
         
-        return f".cache/strategy_{self.strategy_type}_{file_hash}_v20.pkl"
+        # Use simple hash of this string
+        file_hash = hashlib.md5(file_hash.encode()).hexdigest()
+        
+        return f".cache/strategy_{self.strategy_type}_{file_hash}_opt_v3_acc.parquet"
 
     def load_cache(self):
-        """Tenta carregar resultados do cache"""
+        """Tenta carregar resultados do cache (Parquet)"""
         cache_file = self._get_cache_filename()
         if os.path.exists(cache_file):
             try:
                 print(f"Loading cache from {cache_file}...")
-                with open(cache_file, 'rb') as f:
-                    self.all_trades_df = pickle.load(f)
+                self.all_trades_df = pd.read_parquet(cache_file)
                 return not self.all_trades_df.empty
             except Exception as e:
                 print(f"Error loading cache: {e}")
                 return False
         return False
+        return False
 
     def save_cache(self):
-        """Salva resultados no cache"""
+        """Salva resultados no cache (Parquet)"""
         try:
             cache_file = self._get_cache_filename()
             print(f"Saving cache to {cache_file}...")
-            with open(cache_file, 'wb') as f:
-                pickle.dump(self.all_trades_df, f)
+            # Ensure specialized types are handled if necessary, but basic types work well in parquet
+            self.all_trades_df.to_parquet(cache_file, index=False)
         except Exception as e:
             print(f"Error saving cache: {e}")
 
     def load_data(self):
-        # Try Parquet first (10x faster), fallback to CSV and convert
-        parquet_path = self.data_file.replace('.txt', '.parquet').replace('.csv', '.parquet')
+        # Optimization: If DF was passed in constructor, skip loading
+        if self.df is not None:
+            # Still valid to calculate derived columns if needed?
+            # Assuming shared DF is already fully processed.
+            return
+            
+        # Determine paths
+        is_parquet = self.data_file.endswith('.parquet')
         
-        if os.path.exists(parquet_path):
-            self.df = pd.read_parquet(parquet_path)
-            print(f"Loaded from Parquet (fast): {len(self.df)} rows")
+        if is_parquet:
+            print(f"Loading data from Parquet: {self.data_file}")
+            self.df = pd.read_parquet(self.data_file)
         else:
-            print("Parquet not found, loading from CSV and converting...")
-            self.df = pd.read_csv(self.data_file)
-            self.df['time'] = pd.to_datetime(self.df['time'])
-            # Save as Parquet for future fast loading
-            try:
-                self.df.to_parquet(parquet_path, index=False)
-                print(f"Converted to Parquet: {parquet_path}")
-            except Exception as e:
-                print(f"Could not save Parquet: {e}")
+            parquet_path = self.data_file.replace('.txt', '.parquet').replace('.csv', '.parquet')
+            if os.path.exists(parquet_path):
+                print(f"Loaded from Parquet (auto-detected): {parquet_path}")
+                self.df = pd.read_parquet(parquet_path)
+            else:
+                print(f"Loading from Text/CSV: {self.data_file}")
+                # For our specific WIN file, it has no headers if it's the 1.6M rows one, 
+                # but pandas usually detects them if they exist.
+                # Let's try to detect if it's our comma-separated full file.
+                try:
+                    self.df = pd.read_csv(self.data_file)
+                except:
+                    # Fallback for tab-separated or other formats if needed
+                    self.df = pd.read_csv(self.data_file, sep=None, engine='python')
+                
+                self.df['time'] = pd.to_datetime(self.df['time'])
+                # Save as Parquet for future fast loading
+                try:
+                    self.df.to_parquet(parquet_path, index=False)
+                    print(f"Converted and cached to Parquet: {parquet_path}")
+                except Exception as e:
+                    print(f"Could not save Parquet: {e}")
         
         self.df['time'] = pd.to_datetime(self.df['time'])
         self.df['hour'] = self.df['time'].dt.hour
@@ -147,21 +275,8 @@ class StrategyAnalyzer:
                                       (self.df['low'] - self.df['prev_close']).abs()))
         self.df['atr'] = self.df['tr'].rolling(window=20).mean()
 
-        # --- AI Features Pre-Calculation ---
-        # 1. Slope
-        self.df['sma_slope'] = self.df['sma20'].diff()
-        
-        # 2. RSI
-        delta = self.df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / (loss + 1e-9)
-        self.df['rsi'] = 100 - (100 / (1 + rs))
-        
         # 3. Volatility
         self.df['std_dev'] = self.df['close'].rolling(window=20).std()
-        self.df['vol_long'] = self.df['std_dev'].rolling(window=100).mean()
-        self.df['vol_norm'] = self.df['std_dev'] / (self.df['vol_long'] + 1e-9)
 
         # 6. STD Reversal Strategy
         std_candle = self.df[['high', 'low', 'close']].std(axis=1)
@@ -213,8 +328,271 @@ class StrategyAnalyzer:
         self.df['distance_index'] = ((self.df['close'] - self.df['prev_day_important_price']) / 
                                       (self.df['prev_day_important_price'].abs() + 1e-9)) * 100
         
+        # 8. Delta T Acceleration (Derivative of DI) - New request
+        # Vectorized diff (i - (i-1))
+        self.df['delta_di'] = self.df['distance_index'].diff()
+        
+        
         # Cleanup temp column
         self.df.drop(columns=['close_rounded'], inplace=True, errors='ignore')
+        
+    def calculate_signals(self):
+        """Calculates signals using vectorized operations (fast)"""
+        if self.df is None or self.df.empty: return
+        
+        # Prepare signal columns
+        self.df['buy_signal'] = False
+        self.df['sell_signal'] = False
+        
+        if self.strategy_type == 'inside_bar':
+            self._vectorized_inside_bar()
+        elif self.strategy_type == 'micro_channel':
+            self._vectorized_micro_channel()
+        elif self.strategy_type == 'bull_bear':
+            self._vectorized_bull_bear()
+        elif self.strategy_type == 'bull_bear_bear':
+            self._vectorized_bull_bear_bear()
+        elif self.strategy_type == 'sequence_reversal':
+            self._vectorized_sequence_reversal()
+        elif self.strategy_type == 'sma_trend':
+            self._vectorized_sma_trend()
+        elif self.strategy_type == 'std_reversal':
+            self._vectorized_std_reversal()
+        elif self.strategy_type == 'sma_pullback':
+            self._vectorized_sma_pullback()
+        elif self.strategy_type == 'three_soldiers':
+            self._vectorized_three_soldiers()
+        elif self.strategy_type == 'breakout_momentum':
+            self._vectorized_breakout_momentum()
+
+    def _vectorized_inside_bar(self):
+        # Shifted Series for vectorized comparison
+        c = self.df['close']
+        o = self.df['open']
+        sma = self.df['sma20']
+        
+        c3, c2, c1 = c.shift(3), c.shift(2), c.shift(1)
+        o2, o1 = o.shift(2), o.shift(1)
+        sma3 = sma.shift(3)
+        
+        # Mother Bar (i-2) Body
+        body_high_2 = np.maximum(o2, c2)
+        body_low_2 = np.minimum(o2, c2)
+        
+        # Buy: Fractal (Up-Down), c3 > sma3, Inside Bar
+        cond_fractal_buy = (c3 < c2) & (c2 > c1)
+        cond_sma_buy = (c3 > sma3)
+        cond_inside = (o1 >= body_low_2) & (o1 <= body_high_2) & (c1 >= body_low_2) & (c1 <= body_high_2)
+        
+        self.df.loc[cond_fractal_buy & cond_sma_buy & cond_inside, 'buy_signal'] = True
+        
+        # Sell: Fractal (Down-Up), c3 < sma3, Inside Bar
+        cond_fractal_sell = (c3 > c2) & (c2 < c1)
+        cond_sma_sell = (c3 < sma3)
+        # Inside condition is same
+        
+        self.df.loc[cond_fractal_sell & cond_sma_sell & cond_inside, 'sell_signal'] = True
+
+    def _vectorized_micro_channel(self):
+        c = self.df['close']
+        h = self.df['high']
+        l = self.df['low']
+        sma = self.df['sma20']
+        
+        # Shifts
+        h4, h3, h2, h1 = h.shift(4), h.shift(3), h.shift(2), h.shift(1)
+        l4, l1 = l.shift(4), l.shift(1)
+        c1 = c.shift(1)
+        sma1, sma2 = sma.shift(1), sma.shift(2)
+        
+        # Buy: Falling Highs (h4 > h3 > h2), Liquidity Grab (l1 < l4), Trend Up, Slope Up
+        cond_falling = (h4 > h3) & (h3 > h2)
+        cond_grab = (l1 < l4)
+        cond_trend = (c1 > sma1)
+        cond_slope = (sma1 > sma2)
+        
+        self.df.loc[cond_falling & cond_grab & cond_trend & cond_slope, 'buy_signal'] = True
+        
+        # Sell: Rising Highs (h3 < h2 < h1), Trend Down, Slope Down
+        # Original code used: h[i-3] < h[i-2] < h[i-1]
+        cond_rising = (h3 < h2) & (h2 < h1)
+        cond_trend_sell = (c1 < sma1)
+        cond_slope_sell = (sma1 < sma2)
+        
+        self.df.loc[cond_rising & cond_trend_sell & cond_slope_sell, 'sell_signal'] = True
+
+    def _vectorized_bull_bear(self):
+        c = self.df['close']
+        o = self.df['open']
+        l = self.df['low']
+        h = self.df['high']
+        sma = self.df['sma20']
+        
+        c2, c1 = c.shift(2), c.shift(1)
+        o2, o1 = o.shift(2), o.shift(1)
+        l3, l1 = l.shift(3), l.shift(1)
+        h3, h1 = h.shift(3), h.shift(1)
+        sma2 = sma.shift(2)
+        
+        # Buy: i-2 Bull, i-1 Bear, i-2 > SMA, l1 < l3
+        cond_i2_bull = (c2 > o2)
+        cond_i1_bear = (c1 < o1)
+        cond_sma = (c2 > sma2)
+        cond_liq = (l1 < l3)
+        
+        self.df.loc[cond_i2_bull & cond_i1_bear & cond_sma & cond_liq, 'buy_signal'] = True
+        
+        # Sell: i-2 Bear, i-1 Bull, i-2 < SMA, h1 > h3
+        cond_i2_bear = (c2 < o2)
+        cond_i1_bull = (c1 > o1)
+        cond_sma_sell = (c2 < sma2) # note: original used sma[i-2] but let's check. Yes sma[i-2].
+        cond_liq_sell = (h1 > h3)
+        
+        self.df.loc[cond_i2_bear & cond_i1_bull & (c2 < sma2) & cond_liq_sell, 'sell_signal'] = True
+
+    def _vectorized_bull_bear_bear(self):
+        c = self.df['close']
+        o = self.df['open']
+        sma = self.df['sma20']
+        
+        c3, c2, c1 = c.shift(3), c.shift(2), c.shift(1)
+        o3, o2, o1 = o.shift(3), o.shift(2), o.shift(1)
+        sma2 = sma.shift(2)
+        
+        # Buy: i-3 Bull, i-2 Bear, i-1 Bear, i-2 > SMA
+        cond_buy = (c3 > o3) & (c2 < o2) & (c1 < o1) & (c2 > sma2)
+        self.df.loc[cond_buy, 'buy_signal'] = True
+        
+        # Sell: i-3 Bear, i-2 Bull, i-1 Bull, i-2 < SMA
+        cond_sell = (c3 < o3) & (c2 > o2) & (c1 > o1) & (c2 < sma2) 
+        self.df.loc[cond_sell, 'sell_signal'] = True
+
+    def _vectorized_sequence_reversal(self):
+        c = self.df['close']
+        o = self.df['open']
+        sma = self.df['sma20']
+        
+        is_bull = (c > o).astype(int)
+        is_bear = (c < o).astype(int)
+        
+        # Buy: 6 Bears (i-10 to i-5), 3 Bulls (i-4 to i-2), i-5 < SMA
+        # Rolling sum over shifted series
+        # bears check at i-5 (window 6): i-5..i-10
+        bears_seq = is_bear.shift(5).rolling(6).sum() == 6
+        # bulls check at i-2 (window 3): i-2..i-4
+        bulls_seq = is_bull.shift(2).rolling(3).sum() == 3
+        cond_sma = c.shift(5) < sma.shift(5)
+        
+        self.df.loc[bears_seq & bulls_seq & cond_sma, 'buy_signal'] = True
+        
+        # Sell: 6 Bulls (i-10 to i-5), 3 Bears (i-4 to i-2), i-5 > SMA
+        bulls_seq_sell = is_bull.shift(5).rolling(6).sum() == 6
+        bears_seq_sell = is_bear.shift(2).rolling(3).sum() == 3
+        cond_sma_sell = c.shift(5) > sma.shift(5)
+        
+        self.df.loc[bulls_seq_sell & bears_seq_sell & cond_sma_sell, 'sell_signal'] = True
+
+    def _vectorized_sma_trend(self):
+        c = self.df['close']
+        o = self.df['open']
+        sma = self.df['sma20']
+        
+        c2, c1 = c.shift(2), c.shift(1)
+        o1 = o.shift(1)
+        sma2 = sma.shift(2)
+        
+        # Buy: i-2 > SMA, i-1 Bull
+        cond_buy = (c2 > sma2) & (c1 > o1)
+        self.df.loc[cond_buy, 'buy_signal'] = True
+        
+        # Sell: i-2 < SMA, i-1 Bear
+        cond_sell = (c2 < sma2) & (c1 < o1)
+        self.df.loc[cond_sell, 'sell_signal'] = True
+
+    def _vectorized_std_reversal(self):
+        if 'rev_std_buy_signal' not in self.df.columns: return
+        
+        # Buy: > 3 at i-1
+        cond_buy = self.df['rev_std_buy_signal'].shift(1) > 3
+        self.df.loc[cond_buy, 'buy_signal'] = True
+        
+        # Sell: > 3 at i-1
+        cond_sell = self.df['rev_std_sell_signal'].shift(1) > 3
+        self.df.loc[cond_sell, 'sell_signal'] = True
+
+    def _vectorized_sma_pullback(self):
+        c = self.df['close']
+        l = self.df['low']
+        h = self.df['high']
+        sma = self.df['sma20']
+        
+        c5, c2, c1 = c.shift(5), c.shift(2), c.shift(1)
+        l5 = l.shift(5)
+        h5 = h.shift(5)
+        sma5 = sma.shift(5)
+        
+        # Buy: l5 < sma5, c5 > sma5, c1 > c2
+        cond_buy = (l5 < sma5) & (c5 > sma5) & (c1 > c2)
+        self.df.loc[cond_buy, 'buy_signal'] = True
+        
+        # Sell: h5 > sma5, c5 < sma5, c1 < c2
+        cond_sell = (h5 > sma5) & (c5 < sma5) & (c1 < c2)
+        self.df.loc[cond_sell, 'sell_signal'] = True
+
+    def _vectorized_three_soldiers(self):
+        h = self.df['high']
+        l = self.df['low']
+        c = self.df['close']
+        sma = self.df['sma20']
+        
+        h3, h2, h1 = h.shift(3), h.shift(2), h.shift(1)
+        l3, l2, l1 = l.shift(3), l.shift(2), l.shift(1)
+        c1 = c.shift(1)
+        sma1 = sma.shift(1)
+        
+        # Buy: h3 < h2 < h1, c1 > sma1
+        cond_buy = (h3 < h2) & (h2 < h1) & (c1 > sma1)
+        self.df.loc[cond_buy, 'buy_signal'] = True
+        
+        # Sell: l3 > l2 > l1, c1 < sma1
+        cond_sell = (l3 > l2) & (l2 > l1) & (c1 < sma1)
+        self.df.loc[cond_sell, 'sell_signal'] = True
+
+    def _vectorized_breakout_momentum(self):
+        c = self.df['close']
+        o = self.df['open']
+        h = self.df['high']
+        l = self.df['low']
+        sma = self.df['sma20']
+        
+        c4, c3, c2, c1 = c.shift(4), c.shift(3), c.shift(2), c.shift(1)
+        o4, o3, o2, o1 = o.shift(4), o.shift(3), o.shift(2), o.shift(1)
+        h2, h1 = h.shift(2), h.shift(1)
+        l2, l1 = l.shift(2), l.shift(1)
+        sma1 = sma.shift(1)
+        
+        body3 = (c3 - o3).abs()
+        body4 = (c4 - o4).abs()
+        
+        # Buy
+        cond_1 = body3 > (3 * body4)
+        cond_2 = c2 > o2
+        cond_3 = h1 > h2
+        cond_4 = c1 > o1
+        cond_5 = c1 > sma1
+        cond_6 = (c4 > o4) & (c3 < o3)
+        self.df.loc[cond_1 & cond_2 & cond_3 & cond_4 & cond_5 & cond_6, 'buy_signal'] = True
+        
+        # Sell
+        cond_1_s = body3 > (3 * body4)
+        cond_2_s = c2 < o2
+        cond_3_s = l1 < l2
+        cond_4_s = c1 < o1
+        cond_5_s = c1 < sma1
+        cond_6_s = (c4 < o4) & (c3 > o3)
+        self.df.loc[cond_1_s & cond_2_s & cond_3_s & cond_4_s & cond_5_s & cond_6_s, 'sell_signal'] = True
+
+
         
     def check_buy_conditions(self, i):
         if self.strategy_type == 'inside_bar':
@@ -231,6 +609,12 @@ class StrategyAnalyzer:
             return self.check_buy_conditions_sma_trend(i)
         elif self.strategy_type == 'std_reversal':
             return self.check_buy_conditions_std_reversal(i)
+        elif self.strategy_type == 'sma_pullback':
+            return self.check_buy_conditions_sma_pullback(i)
+        elif self.strategy_type == 'three_soldiers':
+            return self.check_buy_conditions_three_soldiers(i)
+        elif self.strategy_type == 'breakout_momentum':
+            return self.check_buy_conditions_breakout_momentum(i)
         return False
 
     def check_sell_conditions(self, i):
@@ -248,6 +632,12 @@ class StrategyAnalyzer:
             return self.check_sell_conditions_bull_bear(i)
         elif self.strategy_type == 'std_reversal':
             return self.check_sell_conditions_std_reversal(i)
+        elif self.strategy_type == 'sma_pullback':
+            return self.check_sell_conditions_sma_pullback(i)
+        elif self.strategy_type == 'three_soldiers':
+            return self.check_sell_conditions_three_soldiers(i)
+        elif self.strategy_type == 'breakout_momentum':
+            return self.check_sell_conditions_breakout_momentum(i)
         return False
 
     def check_buy_conditions_bull_bear_bear(self, i):
@@ -353,61 +743,6 @@ class StrategyAnalyzer:
         cond_slope = sma20[i-1] < sma20[i-2]
         return cond_highs and cond_trend and cond_slope
 
-    def check_ai_filter(self, i, is_buy):
-        if self.ai_model is None: return True # Bypass if no model
-        
-        # Safe access
-        if i >= len(self.df): return False
-        
-        try:
-            row = self.df.iloc[i]
-            
-            rsi = row['rsi']
-            slope = row['sma_slope']
-            vol = row['vol_norm']
-            dist = row['dist_sma']
-            body = row['body_pct']
-            wick_u = row['wick_u_pct']
-            wick_l = row['wick_l_pct']
-            
-            # Check NaNs
-            if pd.isna(rsi) or pd.isna(slope): return False
-            
-            if not is_buy: # Invert for Sell
-                rsi = 100.0 - rsi
-                slope = -slope
-                dist = -dist
-                # Swap Wicks
-                tmp = wick_u
-                wick_u = wick_l
-                wick_l = tmp
-                
-            # Normalize
-            f_rsi = (rsi - 50.0) / 50.0
-            f_slope = np.clip(slope / 5.0, -1.0, 1.0)
-            f_vol = np.clip(vol - 1.0, -1.0, 1.0)
-            f_dist = np.clip(dist / 5.0, -1.0, 1.0)
-            f_body = (body - 0.5) * 2.0
-            f_w_u = (wick_u - 0.5) * 2.0
-            f_w_l = (wick_l - 0.5) * 2.0
-            
-            features = np.array([f_rsi, f_slope, f_vol, f_dist, f_body, f_w_u, f_w_l], dtype=np.float32)
-            
-            # Predict
-            with torch.no_grad():
-                t_x = torch.from_numpy(features).unsqueeze(0).to(self.ai_device) # (1, 7)
-                out = self.ai_model(t_x)
-                probs = torch.softmax(out, dim=1)
-                conf, pred = torch.max(probs, 1)
-                
-                # Threshold 0.60
-                if pred.item() == 1 and conf.item() >= 0.60:
-                    return True
-                return False
-                
-        except Exception as e:
-            # print(f"AI Check Error: {e}")
-            return False
 
     def check_buy_conditions_bull_bear(self, i):
         # i-2 Alta, i-1 Baixa
@@ -565,6 +900,162 @@ class StrategyAnalyzer:
         
         return cond_i2_above_sma and cond_i1_bull
 
+    def check_sell_conditions_sma_pullback(self, i):
+        # Sell: Price > SMA20 at i-5 AND Close i-1 < SMA20 
+        # (Simplified pullback logic: Was above, now below)
+        if i < 5: return False
+        
+        close = self.df['close'].values
+        sma20 = self.df['sma20'].values
+        
+        if pd.isna(sma20[i]): return False
+        
+        was_above = close[i-5] > sma20[i-5]
+        is_below = close[i-1] < sma20[i-1]
+        
+        return was_above and is_below
+
+    def check_buy_conditions_three_soldiers(self, i):
+        # 3 Soldados de Alta
+        # 1. Highs ascendentes: high[i-3] < high[i-2] < high[i-1]
+        # 2. Tendência Bull: close[i-1] > SMA(20)
+        if i < 4: return False
+        
+        high = self.df['high'].values
+        close = self.df['close'].values
+        sma20 = self.df['sma20'].values
+        
+        if pd.isna(sma20[i-1]): return False
+        
+        # Highs ascendentes
+        cond_highs = (high[i-3] < high[i-2]) and (high[i-2] < high[i-1])
+        
+        # Tendência
+        cond_trend = close[i-1] > sma20[i-1]
+        
+        # Opcional: i-1 tem que ser candle de alta? Pela descrição não foi explícito, 
+        # mas "SMA > 20" sugere compra
+        
+        return cond_highs and cond_trend
+
+    def check_sell_conditions_three_soldiers(self, i):
+        # 3 Soldados de Baixa (Three Black Crows logic adaptada)
+        # 1. Lows descendentes: low[i-3] > low[i-2] > low[i-1]
+        # 2. Tendência Bear: close[i-1] < SMA(20)
+        if i < 4: return False
+        
+        low = self.df['low'].values
+        close = self.df['close'].values
+        sma20 = self.df['sma20'].values
+        
+        if pd.isna(sma20[i-1]): return False
+        
+        # Lows descendentes
+        cond_lows = (low[i-3] > low[i-2]) and (low[i-2] > low[i-1])
+        
+        # Tendência
+        cond_trend = close[i-1] < sma20[i-1]
+        
+        return cond_lows and cond_trend
+
+    def check_buy_conditions_breakout_momentum(self, i):
+        # Estratégia Breakout Momentum (Compra)
+        # 1. Corpo i-3 > 3x Corpo i-4
+        # 2. i-2 é de Alta (close > open)
+        # 3. High i-1 > High i-2
+        # 4. i-1 é de Alta
+        # 5. Close i-1 > SMA(20)
+        if i < 5: return False
+        
+        close = self.df['close'].values
+        open_p = self.df['open'].values
+        high = self.df['high'].values
+        sma20 = self.df['sma20'].values
+        
+        if pd.isna(sma20[i-1]): return False
+        
+        # Tamanho dos corpos
+        body_i3 = abs(close[i-3] - open_p[i-3])
+        body_i4 = abs(close[i-4] - open_p[i-4])
+        
+        # 6. Direção dos candles (Invertido a pedido do usuario):
+        #    i-4 deve ser de ALTA (preparação)
+        #    i-3 deve ser de BAIXA (explosão - Dip Buying?)
+        
+        cond_1 = body_i3 > (3 * body_i4)
+        cond_2 = close[i-2] > open_p[i-2]
+        cond_3 = high[i-1] > high[i-2]
+        cond_4 = close[i-1] > open_p[i-1]
+        cond_5 = close[i-1] > sma20[i-1]
+        
+        # Direção i-4 (Alta) e i-3 (Baixa)
+        cond_6 = (close[i-4] > open_p[i-4]) and (close[i-3] < open_p[i-3])
+        
+        return cond_1 and cond_2 and cond_3 and cond_4 and cond_5 and cond_6
+
+    def check_sell_conditions_breakout_momentum(self, i):
+        # Estratégia Breakout Momentum (Venda)
+        # 1. Corpo i-3 > 3x Corpo i-4
+        # 2. i-2 é de Baixa (close < open)
+        # 3. Low i-1 < Low i-2
+        # 4. i-1 é de Baixa
+        # 5. Close i-1 < SMA(20)
+        if i < 5: return False
+        
+        close = self.df['close'].values
+        open_p = self.df['open'].values
+        low = self.df['low'].values
+        sma20 = self.df['sma20'].values
+        
+        if pd.isna(sma20[i-1]): return False
+        
+        # Tamanho dos corpos
+        body_i3 = abs(close[i-3] - open_p[i-3])
+        body_i4 = abs(close[i-4] - open_p[i-4])
+        
+        # 6. Direção dos candles (Invertido):
+        #    i-4 deve ser de BAIXA (preparação)
+        #    i-3 deve ser de ALTA (explosão - Top Selling?)
+        
+        cond_1 = body_i3 > (3 * body_i4)
+        cond_2 = close[i-2] < open_p[i-2]
+        cond_3 = low[i-1] < low[i-2]
+        cond_4 = close[i-1] < open_p[i-1]
+        cond_5 = close[i-1] < sma20[i-1]
+        
+        # Direção i-4 (Baixa) e i-3 (Alta)
+        cond_6 = (close[i-4] < open_p[i-4]) and (close[i-3] > open_p[i-3])
+        
+        return cond_1 and cond_2 and cond_3 and cond_4 and cond_5 and cond_6
+
+    def check_buy_conditions_sma_pullback(self, i):
+        # low[i-5] < sma(20); close[i-5] > sma(20); close[i-1] > close[i-2]
+        if i < 20: return False
+        close = self.df['close'].values
+        low = self.df['low'].values
+        sma20 = self.df['sma20'].values
+        
+        if pd.isna(sma20[i-5]): return False
+        
+        cond_pullback = low[i-5] < sma20[i-5] and close[i-5] > sma20[i-5]
+        cond_trigger = close[i-1] > close[i-2]
+        
+        return cond_pullback and cond_trigger
+
+    def check_sell_conditions_sma_pullback(self, i):
+        # high[i-5] > sma(20); close[i-5] < sma(20); close[i-1] < close[i-2]
+        if i < 20: return False
+        close = self.df['close'].values
+        high = self.df['high'].values
+        sma20 = self.df['sma20'].values
+        
+        if pd.isna(sma20[i-5]): return False
+        
+        cond_pullback = high[i-5] > sma20[i-5] and close[i-5] < sma20[i-5]
+        cond_trigger = close[i-1] < close[i-2]
+        
+        return cond_pullback and cond_trigger
+
     def calculate_angle(self, i):
         if i < 5: return 0
         sma = self.df['sma20'].values
@@ -623,17 +1114,8 @@ class StrategyAnalyzer:
         winner = False
         exit_bars = 0
         
-        for j in range(entry_idx, len(self.df)):
-            exit_bars += 1
-            if headers[j] >= target_price:
-                exit_price = target_price
-                winner = True
-                break
-            if lowers[j] <= stop_price:
-                exit_price = stop_price
-                winner = False
-                break
-            exit_price = closes[j] # Mark to market se acabar dataframe
+        # Numba Optimized Search
+        exit_price, winner, exit_bars = find_exit_buy_numba(headers, lowers, closes, entry_idx, target_price, stop_price)
             
         result = exit_price - entry_price
         
@@ -663,7 +1145,8 @@ class StrategyAnalyzer:
             'ratio_label': ratio_label,
             'slope_degrees': float(slope_deg),
             'dist_sma_i2': float(dist_sma_i2),
-            'distance_index_i2': float(self.df['distance_index'].values[entry_idx - 2]) if not pd.isna(self.df['distance_index'].values[entry_idx - 2]) else 0.0
+            'distance_index_i2': float(self.df['distance_index'].values[entry_idx - 2]) if not pd.isna(self.df['distance_index'].values[entry_idx - 2]) else 0.0,
+            'delta_di_i2': float(self.df['delta_di'].values[entry_idx - 2]) if not pd.isna(self.df['delta_di'].values[entry_idx - 2]) else 0.0
         }
 
     def simulate_sell_trade(self, entry_idx, tp_mult, sl_mult, ratio_label):
@@ -695,17 +1178,8 @@ class StrategyAnalyzer:
         winner = False
         exit_bars = 0
         
-        for j in range(entry_idx, len(self.df)):
-            exit_bars += 1
-            if lowers[j] <= target_price:
-                exit_price = target_price
-                winner = True
-                break
-            if headers[j] >= stop_price:
-                exit_price = stop_price
-                winner = False
-                break
-            exit_price = closes[j]
+        # Numba Optimized Search
+        exit_price, winner, exit_bars = find_exit_sell_numba(headers, lowers, closes, entry_idx, target_price, stop_price)
             
         result = entry_price - exit_price
         slope_deg = self.calculate_angle(entry_idx)
@@ -733,14 +1207,12 @@ class StrategyAnalyzer:
             'ratio_label': ratio_label,
             'slope_degrees': float(slope_deg),
             'dist_sma_i2': float(dist_sma_i2),
-            'distance_index_i2': float(self.df['distance_index'].values[entry_idx - 2]) if not pd.isna(self.df['distance_index'].values[entry_idx - 2]) else 0.0
+            'distance_index_i2': float(self.df['distance_index'].values[entry_idx - 2]) if not pd.isna(self.df['distance_index'].values[entry_idx - 2]) else 0.0,
+            'delta_di_i2': float(self.df['delta_di'].values[entry_idx - 2]) if not pd.isna(self.df['delta_di'].values[entry_idx - 2]) else 0.0
         }
 
     def run_backtest(self):
-        # Tenta carregar do cache antes de carregar dados pesados
-        # Mas para verificar hash, precisa ler o arquivo.
-        # load_cache chama _get_cache_filename que lê o arquivo.
-        
+        # Tenta carregar do cache
         if self.load_cache():
             self.set_active_ratio(self.AVAILABLE_RATIOS[2]['label'])
             print("Loaded from Cache.")
@@ -748,51 +1220,143 @@ class StrategyAnalyzer:
 
         self.load_data() # Load heavy data only if needed
 
-        self.signals = []
-        i = 20 # Start check index
-        length = len(self.df)
+        # 1. Calculate Signals using Vectorized Logic
+        print("Finding signals (Vectorized)...")
+        start_time = datetime.now()
+        self.calculate_signals()
         
-        print("Finding signals...")
-        # Loop otimizado? Não, Python puro.
-        while i < length - 1:
-            is_buy = False
-            is_sell = False
+        # 2. Pre-calculate metrics for all rows to allow fast indexing
+        # Volatility (Mean range of last 20 candles ending at i-1)
+        # Shift(1) gives range at i-1. Rolling(20).mean() gives mean of i-20..i-1
+        self.df['volatility_calc'] = self.df['range'].shift(1).rolling(window=20).mean()
+        
+        # Slope Degrees
+        # calculate_angle logic: dy = sma - sma(i-5). 
+        dy = self.df['sma20'] - self.df['sma20'].shift(5)
+        avg_atr = self.df['atr'].fillna(1.0)
+        norm_slope = ((dy / 5) / avg_atr) * 10
+        self.df['slope_deg'] = np.degrees(np.arctan(norm_slope))
+        
+        # Dist SMA (Points, Absolute, at i-2)
+        self.df['dist_sma_points'] = (self.df['close'] - self.df['sma20']).abs()
+        
+        # Shifts for i-2 metrics (used in results)
+        self.df['dist_sma_points_i2'] = self.df['dist_sma_points'].shift(2)
+        self.df['distance_index_i2'] = self.df['distance_index'].shift(2)
+        self.df['delta_di_i2'] = self.df['delta_di'].shift(2)
+        
+        # Volume SMA and Slope
+        if 'tick_volume' in self.df.columns:
+            self.df['vol_sma20'] = self.df['tick_volume'].rolling(window=20).mean()
+            self.df['vol_slope'] = self.df['vol_sma20'].diff()
+            # Capture for i-2 (signal time reference)
+            self.df['vol_slope_i2'] = self.df['vol_slope'].shift(2)
+        else:
+            self.df['vol_slope_i2'] = 0.0
             
-            if self.strategy_type == 'micro_channel':
-                is_buy = self.check_buy_conditions_micro(i)
-                is_sell = self.check_sell_conditions_micro(i)
-            else:
-                is_buy = self.check_buy_conditions(i)
-                is_sell = self.check_sell_conditions(i)
+        # Jerk (Difference of Delta T) = Diff of Delta DI
+        self.df['jerk_di'] = self.df['delta_di'].diff()
+        self.df['jerk_di_i2'] = self.df['jerk_di'].shift(2)
+        
+        # Filter for signals
+        # We need to drop NaNs created by shifts to avoid issues, or handled by subset
+        signal_mask = (self.df['buy_signal'] | self.df['sell_signal'])
+        # Limit start index to 20 as per original
+        signal_mask.iloc[:20] = False
+        
+        signals_df = self.df.loc[signal_mask].copy()
+        
+        print(f"Found {len(signals_df)} signals. Calculating all ratios (Vectorized)...")
+        
+        if signals_df.empty:
+            self.all_trades_df = pd.DataFrame()
+            self.save_cache()
+            return
             
-            if is_buy:
-                self.signals.append({'idx': i, 'direction': 'buy'})
-                i += 1 # Check next candle? Usually skip inside trades?
-            elif is_sell:
-                self.signals.append({'idx': i, 'direction': 'sell'})
-                i += 1
-            else:
-                i += 1
+        # Prepare arrays for Numba
+        entry_indices = signals_df.index.values
+        # Directions: 1 for Buy, -1 for Sell
+        directions = np.where(signals_df['buy_signal'], 1, -1).astype(np.int32)
         
-        print(f"Found {len(self.signals)} signals. Calculating all ratios...")
+        # Ranges for TP/SL Calculation
+        # Micro Channel: Range at i-1
+        # Others: Range at i-2
+        if self.strategy_type == 'micro_channel':
+            ranges = self.df['range'].shift(1).loc[signal_mask].values
+        else:
+            ranges = self.df['range'].shift(2).loc[signal_mask].values
+            
+        # Ensure range > 0 (fallback to 5 as in original)
+        ranges = np.where(ranges <= 0, 5.0, ranges)
         
-        all_trades = []
+        # Data Arrays for Simulation
+        opens_arr = self.df['open'].values
+        highs_arr = self.df['high'].values
+        lows_arr = self.df['low'].values
+        closes_arr = self.df['close'].values
+        
+        all_dfs = []
+        
         for ratio in self.AVAILABLE_RATIOS:
-            tp_mult = ratio['tp']
-            sl_mult = ratio['sl']
+            tp_mult = float(ratio['tp'])
+            sl_mult = float(ratio['sl'])
             ratio_label = ratio['label']
             
-            for signal in self.signals:
-                if signal['direction'] == 'buy':
-                    trade = self.simulate_buy_trade(signal['idx'], tp_mult, sl_mult, ratio_label)
-                else:
-                    trade = self.simulate_sell_trade(signal['idx'], tp_mult, sl_mult, ratio_label)
-                all_trades.append(trade)
-        
-        self.all_trades_df = pd.DataFrame(all_trades)
-        
-        # Calculate Volatility Levels globally
-        if not self.all_trades_df.empty:
+            # Batch Simulation
+            results, winners, exit_prices, exit_bars, targets, stops = simulate_trades_batch_numba(
+                entry_indices, directions, opens_arr, highs_arr, lows_arr, closes_arr, ranges, tp_mult, sl_mult
+            )
+            
+            # Create DataFrame for this ratio
+            ratio_df = signals_df.copy()
+            ratio_df['entry_idx'] = entry_indices
+            ratio_df['entry_price'] = closes_arr[entry_indices - 1] # Entry at Close[i-1] matches original
+            ratio_df['entry_time'] = self.df.loc[entry_indices - 1, 'time'].values # Entry time at i-1
+            # Note: signals_df index is 'i'. original 'entry_time' was df['time'].values[entry_idx-1].
+            # signals_df['time'] is time at 'i'. We want time at 'i-1'.
+            
+            ratio_df['direction'] = np.where(directions == 1, 'Compra', 'Venda')
+            ratio_df['result'] = results
+            ratio_df['winner'] = winners
+            ratio_df['exit_price'] = exit_prices
+            ratio_df['exit_bars'] = exit_bars
+            ratio_df['target_price'] = targets
+            ratio_df['stop_price'] = stops
+            ratio_df['ratio_label'] = ratio_label
+            ratio_df['volatility'] = ratio_df['volatility_calc']
+            ratio_df['dist_sma_i2'] = ratio_df['dist_sma_points_i2']
+            
+            # Slope degrees already in signals_df (calculated for all)
+            ratio_df['slope_degrees'] = ratio_df['slope_deg']
+            
+            # Calculate Points
+            # For Buy: result = exit - entry. TP points = target - entry
+            # For Sell: result = entry - exit. TP points = entry - target
+            ratio_df['tp_points'] = np.where(directions == 1, ratio_df['target_price'] - ratio_df['entry_price'], ratio_df['entry_price'] - ratio_df['target_price'])
+            ratio_df['sl_points'] = np.where(directions == 1, ratio_df['entry_price'] - ratio_df['stop_price'], ratio_df['stop_price'] - ratio_df['entry_price'])
+            
+            # RR Ratio
+            # Avoid div by zero
+            sl_p = ratio_df['sl_points']
+            ratio_df['rr_ratio'] = np.where(sl_p != 0, ratio_df['tp_points'] / sl_p, 0.0)
+            
+            # Keep only necessary columns
+            keep_cols = ['entry_time', 'entry_price', 'exit_price', 'result', 'winner', 'direction', 
+                         'hour', 'weekday', 'year', 'month', 'year_month', 'volatility', 'exit_bars', 
+                         'entry_idx', 'target_price', 'stop_price', 'tp_points', 'sl_points', 'rr_ratio',
+                         'ratio_label', 'slope_degrees', 'dist_sma_i2', 'distance_index_i2', 'delta_di_i2',
+                         'vol_slope', 'jerk_di']
+            
+            # Map i2 cols
+            ratio_df['vol_slope'] = ratio_df['vol_slope_i2']
+            ratio_df['jerk_di'] = ratio_df['jerk_di_i2']
+            
+            all_dfs.append(ratio_df[keep_cols])
+
+        if all_dfs:
+            self.all_trades_df = pd.concat(all_dfs, ignore_index=True)
+            
+            # Levels Calculation (Vectorized on full result)
             try:
                 self.all_trades_df['vol_level'] = pd.qcut(self.all_trades_df['volatility'], q=5, labels=['Muito Baixa', 'Baixa', 'Média', 'Alta', 'Muito Alta'], duplicates='drop').astype(str)
             except: self.all_trades_df['vol_level'] = 'Média'
@@ -804,7 +1368,25 @@ class StrategyAnalyzer:
             try:
                 self.all_trades_df['di_level'] = pd.qcut(self.all_trades_df['distance_index_i2'].abs(), q=10, labels=[f'DI{i}' for i in range(1, 11)], duplicates='drop').astype(str)
             except: self.all_trades_df['di_level'] = 'DI5'
-
+            
+            try:
+                self.all_trades_df['acc_level'] = pd.qcut(self.all_trades_df['delta_di_i2'], q=20, labels=[f'ACC{i}' for i in range(1, 21)], duplicates='drop').astype(str)
+            except: self.all_trades_df['acc_level'] = 'ACC10'
+            
+            # Volume Slope Levels (5 bins)
+            try:
+                self.all_trades_df['vol_slope_level'] = pd.qcut(self.all_trades_df['vol_slope'], q=5, labels=['Queda Forte', 'Queda Leve', 'Flat', 'Subida Leve', 'Subida Forte'], duplicates='drop').astype(str)
+            except: self.all_trades_df['vol_slope_level'] = 'Flat'
+            
+            # Jerk Levels (Difference of Delta T - 20 bins)
+            try:
+                self.all_trades_df['jerk_level'] = pd.qcut(self.all_trades_df['jerk_di'], q=20, labels=[f'J{i}' for i in range(1, 21)], duplicates='drop').astype(str)
+            except: self.all_trades_df['jerk_level'] = 'J10'
+        else:
+             self.all_trades_df = pd.DataFrame()
+             
+        end_time = datetime.now()
+        print(f"Backtest finished in {(end_time - start_time).total_seconds():.2f}s")
         self.save_cache()
         self.set_active_ratio(self.AVAILABLE_RATIOS[2]['label'])
 
@@ -848,6 +1430,21 @@ class StrategyAnalyzer:
         if filters.get('di_levels'):
             if 'di_level' in self.filtered_df.columns:
                 self.filtered_df = self.filtered_df[self.filtered_df['di_level'].isin(filters['di_levels'])]
+        if filters.get('acc_levels'):
+            if 'acc_level' in self.filtered_df.columns:
+                self.filtered_df = self.filtered_df[self.filtered_df['acc_level'].isin(filters['acc_levels'])]
+        if filters.get('acc_levels'):
+            if 'acc_level' in self.filtered_df.columns:
+                self.filtered_df = self.filtered_df[self.filtered_df['acc_level'].isin(filters['acc_levels'])]
+        
+        # New Filters
+        if filters.get('vol_slope_levels'):
+            if 'vol_slope_level' in self.filtered_df.columns:
+                self.filtered_df = self.filtered_df[self.filtered_df['vol_slope_level'].isin(filters['vol_slope_levels'])]
+        
+        if filters.get('jerk_levels'):
+            if 'jerk_level' in self.filtered_df.columns:
+                self.filtered_df = self.filtered_df[self.filtered_df['jerk_level'].isin(filters['jerk_levels'])]
             
         if filters.get('invert'):
             self.filtered_df['result'] = -self.filtered_df['result']
@@ -873,6 +1470,9 @@ class StrategyAnalyzer:
              df['angle_bin'] = pd.cut(df['slope_degrees'].abs(), bins=bins, labels=labels, right=False)
              df = df[df['angle_bin'].isin(filters['angle_ranges'])]
         if filters.get('di_levels') and 'di_level' in df.columns: df = df[df['di_level'].isin(filters['di_levels'])]
+        if filters.get('acc_levels') and 'acc_level' in df.columns: df = df[df['acc_level'].isin(filters['acc_levels'])]
+        if filters.get('vol_slope_levels') and 'vol_slope_level' in df.columns: df = df[df['vol_slope_level'].isin(filters['vol_slope_levels'])]
+        if filters.get('jerk_levels') and 'jerk_level' in df.columns: df = df[df['jerk_level'].isin(filters['jerk_levels'])]
         if filters.get('invert'):
             df['result'] = -df['result']
             df['winner'] = ~df['winner']
@@ -1076,6 +1676,82 @@ class StrategyAnalyzer:
                     'sharpe_ratio': float(round(self.calculate_sharpe(d['result']), 2))
                 })
         return stats
+        
+    def get_stats_by_acc(self, use_filtered=False):
+        df = self.filtered_df if use_filtered else self.trades_df
+        if df.empty: return []
+        # Predefined order ACC1 to ACC20
+        labels = [f'ACC{i}' for i in range(1, 21)]
+        stats = []
+        for l in labels:
+            d = df[df['acc_level']==l]
+            if len(d) > 0:
+                stats.append({
+                    'acc_level': l,
+                    'trades': len(d),
+                    'win_rate': float(round((d['winner'].sum()/len(d)*100), 2)),
+                    'total_profit': float(round(d['result'].sum(), 2)),
+                    'avg_profit': float(round(d['result'].mean(), 2)),
+                    'sharpe_ratio': float(round(self.calculate_sharpe(d['result']), 2))
+                })
+        return stats
+
+    def get_stats_by_vol_slope(self, use_filtered=False):
+        df = self.filtered_df if use_filtered else self.trades_df
+        if df.empty or 'vol_slope_level' not in df.columns: return []
+        # Custom sort order
+        order = ['Queda Forte', 'Queda Leve', 'Flat', 'Subida Leve', 'Subida Forte']
+        stats = []
+        for l in order:
+            d = df[df['vol_slope_level'].astype(str)==l]
+            if len(d) > 0:
+                stats.append({
+                    'vol_slope_level': l,
+                    'trades': len(d),
+                    'win_rate': float(round((d['winner'].sum()/len(d)*100), 2)),
+                    'total_profit': float(round(d['result'].sum(), 2)),
+                    'avg_profit': float(round(d['result'].mean(), 2)),
+                    'sharpe_ratio': float(round(self.calculate_sharpe(d['result']), 2))
+                })
+        return stats
+
+    def get_stats_by_jerk(self, use_filtered=False):
+        df = self.filtered_df if use_filtered else self.trades_df
+        if df.empty: return []
+        # Predefined order J1 to J20
+        labels = [f'J{i}' for i in range(1, 21)]
+        stats = []
+        for l in labels:
+            d = df[df['jerk_level'].astype(str)==l]
+            if len(d) > 0:
+                stats.append({
+                    'jerk_level': l,
+                    'trades': len(d),
+                    'win_rate': float(round((d['winner'].sum()/len(d)*100), 2)),
+                    'total_profit': float(round(d['result'].sum(), 2)),
+                    'avg_profit': float(round(d['result'].mean(), 2)),
+                    'sharpe_ratio': float(round(self.calculate_sharpe(d['result']), 2))
+                })
+        return stats
+        
+    def get_stats_by_acc(self, use_filtered=False):
+        df = self.filtered_df if use_filtered else self.trades_df
+        if df.empty: return []
+        # Predefined order ACC1 to ACC20
+        labels = [f'ACC{i}' for i in range(1, 21)]
+        stats = []
+        for l in labels:
+            d = df[df['acc_level']==l]
+            if len(d) > 0:
+                stats.append({
+                    'acc_level': l,
+                    'trades': len(d),
+                    'win_rate': float(round((d['winner'].sum()/len(d)*100), 2)),
+                    'total_profit': float(round(d['result'].sum(), 2)),
+                    'avg_profit': float(round(d['result'].mean(), 2)),
+                    'sharpe_ratio': float(round(self.calculate_sharpe(d['result']), 2))
+                })
+        return stats
 
     def get_stats_by_angle(self, use_filtered=False):
         df = self.filtered_df if use_filtered else self.trades_df
@@ -1164,5 +1840,8 @@ class StrategyAnalyzer:
             'volatility_levels': ['Muito Baixa', 'Baixa', 'Média', 'Alta', 'Muito Alta'],
             'dist_levels': [f'D{i}' for i in range(1, 11)],
             'di_levels': [f'DI{i}' for i in range(1, 11)],
-            'angle_ranges': [f'{i}-{i+5}°' for i in range(0, 90, 5)] + ['90°+'] 
+            'angle_ranges': [f'{i}-{i+5}°' for i in range(0, 90, 5)] + ['90°+'],
+            'acc_levels': [f'ACC{i}' for i in range(1, 21)],
+            'vol_slope_levels': ['Queda Forte', 'Queda Leve', 'Flat', 'Subida Leve', 'Subida Forte'],
+            'jerk_levels': [f'J{i}' for i in range(1, 21)]
         }

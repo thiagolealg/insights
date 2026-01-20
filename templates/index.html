@@ -62,7 +62,10 @@
                 { id: 'bull_bear_bear', name: 'Alta-Baixa-Baixa', bg: 'transparent' },
                 { id: 'sequence_reversal', name: 'Reversão Seq.', bg: 'transparent' },
                 { id: 'sma_trend', name: 'Tendência SMA', bg: 'transparent' },
-                { id: 'std_reversal', name: 'Reversão STD', bg: 'transparent' }
+                { id: 'std_reversal', name: 'Reversão (Desvio)', bg: 'transparent' },
+                { id: 'sma_pullback', name: 'SMA Pullback (i-5)', bg: 'transparent' },
+                { id: 'three_soldiers', name: 'Três Soldados', bg: 'transparent' },
+                { id: 'breakout_momentum', name: 'Breakout Momentum', bg: 'transparent' }
             ];
 
             // Render Tabs on Load
@@ -119,8 +122,8 @@
 
 
         <header class="individual-only">
-            <h1 id="page-title">Estratégia Inside Bar</h1>
-            <p class="subtitle" id="page-subtitle">Análise completa de performance - Compra e Venda</p>
+            <h1 id="page-title">Estratégia Inside Bar <span style="font-size: 0.6em; color: #64748b;">v1.1</span></h1>
+            <p class="subtitle" id="page-subtitle">Análise completa de performance - Compra e Venda (Otimizado)</p>
         </header>
 
         <!-- Overview Section removed -->
@@ -231,6 +234,51 @@
                 </div>
             </div>
 
+            <div id="rules-sma_pullback" class="strategy-conditions" style="display: none;">
+                <div class="condition">
+                    <span class="condition-label">Venda (Pullback Simples):</span>
+                    <code>low[i-5] < SMA(20) e close[i-5] > SMA(20)</code>
+                    <code>close[i-1] > close[i-2]</code>
+                    <code>close[i-1] < SMA(20)</code>
+                </div>
+            </div>
+
+            <div id="rules-three_soldiers" class="strategy-conditions" style="display: none;">
+                <div class="condition">
+                    <span class="condition-label">Compra (3 Soldados Alta):</span>
+                    <code>Candles i-3, i-2, i-1: SEQUÊNCIA DE ALTA</code>
+                    <code>high[i-3] < high[i-2] < high[i-1]</code>
+                    <code>close[i-3] < close[i-2] < close[i-1]</code>
+                    <code>close[i-1] > SMA(20)</code>
+                </div>
+                <div class="condition">
+                    <span class="condition-label">Venda (3 Corvos Baixa):</span>
+                    <code>Candles i-3, i-2, i-1: SEQUÊNCIA DE BAIXA</code>
+                    <code>low[i-3] > low[i-2] > low[i-1]</code>
+                    <code>close[i-3] > close[i-2] > close[i-1]</code>
+                    <code>close[i-1] < SMA(20)</code>
+                </div>
+            </div>
+
+            <div id="rules-breakout_momentum" class="strategy-conditions" style="display: none;">
+                <div class="condition">
+                    <span class="condition-label">Compra (Explosão):</span>
+                    <code>i-4 ALTA; i-3 BAIXA (Explosão) (Corrigido)</code>
+                    <code>Corpo[i-3] > 3x Corpo[i-4]</code>
+                    <code>i-2 Alta (close > open)</code>
+                    <code>high[i-1] > high[i-2]</code>
+                    <code>close[i-1] > SMA(20)</code>
+                </div>
+                <div class="condition">
+                    <span class="condition-label">Venda (Explosão):</span>
+                    <code>i-4 BAIXA; i-3 ALTA (Explosão) (Corrigido)</code>
+                    <code>Corpo[i-3] > 3x Corpo[i-4]</code>
+                    <code>i-2 Baixa (close < open)</code>
+                    <code>low[i-1] < low[i-2]</code>
+                    <code>close[i-1] < SMA(20)</code>
+                </div>
+            </div>
+
             <!-- Rules for Micro Channel (Hidden by default) -->
             <div id="rules-micro-channel" class="strategy-conditions" style="display: none;">
                 <div class="condition">
@@ -298,6 +346,18 @@
                 <div class="filter-group">
                     <label>Índice de Distância (Preço Dia Anterior):</label>
                     <div class="checkbox-group" id="filter-di"></div>
+                </div>
+                <div class="filter-group">
+                    <label>Aceleração Delta T (Derivada DI):</label>
+                    <div class="checkbox-group" id="filter-acc"></div>
+                </div>
+                <div class="filter-group">
+                    <label>Inclinação da Média do Volume:</label>
+                    <div class="checkbox-group" id="filter-vol-slope"></div>
+                </div>
+                <div class="filter-group">
+                    <label>Variação Delta T (20 Tipos - Jerk):</label>
+                    <div class="checkbox-group" id="filter-jerk"></div>
                 </div>
                 <div class="filter-group"
                     style="background: linear-gradient(135deg, #1e3a5f 0%, #2d4a6f 100%); padding: 12px; border-radius: 8px; border: 1px solid #3b82f6;">
@@ -423,6 +483,22 @@
                 <div class="chart-container">
                     <h3>Performance por Índice de Distância (Preço Dia Anterior)</h3>
                     <canvas id="diChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-row">
+                <div class="chart-container" style="flex: 1; min-width: 400px;">
+                    <h3>Performance por Aceleração Delta T (20 Níveis)</h3>
+                    <canvas id="accChart"></canvas>
+                </div>
+                <div class="chart-container" style="flex: 1; min-width: 400px;">
+                    <h3>Performance por Inclinação Volume SMA</h3>
+                    <canvas id="volSlopeChart"></canvas>
+                </div>
+            </div>
+            <div class="chart-row">
+                <div class="chart-container" style="flex: 1; min-width: 400px;">
+                    <h3>Performance por Variação Delta T (Jerk 20 Níveis)</h3>
+                    <canvas id="jerkChart"></canvas>
                 </div>
             </div>
         </section>
@@ -557,6 +633,62 @@
                 <thead>
                     <tr>
                         <th>Índice (DI1=Próximo, DI10=Distante)</th>
+                        <th>Trades</th>
+                        <th>Win Rate</th>
+                        <th>Lucro Total</th>
+                        <th>Lucro Médio</th>
+                        <th>Sharpe</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+    </div>
+
+    <div class="individual-only" style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px;">
+        <div class="table-container" style="flex: 1; min-width: 400px;">
+            <h3>Estatísticas por Aceleração Delta T</h3>
+            <table id="acc-table">
+                <thead>
+                    <tr>
+                        <th>Nível (ACC1=Desacel, ACC20=Acel)</th>
+                        <th>Trades</th>
+                        <th>Win Rate</th>
+                        <th>Lucro Total</th>
+                        <th>Lucro Médio</th>
+                        <th>Sharpe</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+
+        <div class="table-container" style="flex: 1; min-width: 400px;">
+            <h3>Estatísticas por Inclinação Volume SMA</h3>
+            <table id="vol-slope-table">
+                <thead>
+                    <tr>
+                        <th>Inclinação</th>
+                        <th>Trades</th>
+                        <th>Win Rate</th>
+                        <th>Lucro Total</th>
+                        <th>Lucro Médio</th>
+                        <th>Sharpe</th>
+                    </tr>
+                </thead>
+                <tbody></tbody>
+            </table>
+        </div>
+    </div>
+
+    <div class="individual-only" style="display: flex; gap: 20px; flex-wrap: wrap; margin-bottom: 20px;">
+        <div class="table-container" style="flex: 1; min-width: 400px;">
+            <h3>Estatísticas por Variação Delta T (Jerk)</h3>
+            <table id="jerk-table">
+                <thead>
+                    <tr>
+                        <th>Nível (J1=Negativo, J20=Positivo)</th>
                         <th>Trades</th>
                         <th>Win Rate</th>
                         <th>Lucro Total</th>
@@ -734,17 +866,22 @@
             'bull_bear_bear': 'Estratégia Alta-Baixa-Baixa',
             'sequence_reversal': 'Estratégia Reversão Sequência',
             'sma_trend': 'Estratégia Tendência SMA',
-            'std_reversal': 'Estratégia Reversão STD'
+            'std_reversal': 'Estratégia Reversão STD',
+            'sma_pullback': 'Estratégia Pullback SMA (i-5)',
+            'three_soldiers': 'Estratégia Três Soldados',
+            'breakout_momentum': 'Estratégia Breakout Momentum'
         };
-
         const rulesIds = {
             'inside_bar': 'rules-inside-bar',
-            'micro_channel': 'rules-micro-channel',
+            'micro_channel': 'rules-micro_channel',
             'bull_bear': 'rules-bull_bear',
             'bull_bear_bear': 'rules-bull_bear_bear',
             'sequence_reversal': 'rules-sequence_reversal',
             'sma_trend': 'rules-sma_trend',
-            'std_reversal': 'rules-std_reversal'
+            'std_reversal': 'rules-std_reversal',
+            'sma_pullback': 'rules-sma_pullback',
+            'three_soldiers': 'rules-three_soldiers',
+            'breakout_momentum': 'rules-breakout_momentum'
         };
 
         async function switchStrategyTab(strategyType) {
@@ -830,7 +967,11 @@
             if (data.volatility_levels) createCheckboxes('filter-volatility', data.volatility_levels);
             if (data.angle_ranges) createCheckboxes('filter-angles', data.angle_ranges);
             if (data.dist_levels) createCheckboxes('filter-dist-sma', data.dist_levels);
+            if (data.dist_levels) createCheckboxes('filter-dist-sma', data.dist_levels);
             if (data.di_levels) createCheckboxes('filter-di', data.di_levels);
+            if (data.acc_levels) createCheckboxes('filter-acc', data.acc_levels);
+            if (data.vol_slope_levels) createCheckboxes('filter-vol-slope', data.vol_slope_levels);
+            if (data.jerk_levels) createCheckboxes('filter-jerk', data.jerk_levels);
             // Ratio dropdown - não precisa popular, já está no HTML
         }
 
@@ -843,9 +984,12 @@
             const angles = Array.from(document.querySelectorAll('#filter-angles input:checked')).map(c => c.value);
             const dist_levels = Array.from(document.querySelectorAll('#filter-dist-sma input:checked')).map(c => c.value);
             const di_levels = Array.from(document.querySelectorAll('#filter-di input:checked')).map(c => c.value);
+            const acc_levels = Array.from(document.querySelectorAll('#filter-acc input:checked')).map(c => c.value);
+            const vol_slope_levels = Array.from(document.querySelectorAll('#filter-vol-slope input:checked')).map(c => c.value);
+            const jerk_levels = Array.from(document.querySelectorAll('#filter-jerk input:checked')).map(c => c.value);
             const invert = document.getElementById('filter-invert').checked;
 
-            const filters = { direction, hours, weekdays, years, volatility, angle_ranges: angles, dist_levels, di_levels, invert, strategy: currentStrategy };
+            const filters = { direction, hours, weekdays, years, volatility, angle_ranges: angles, dist_levels, di_levels, acc_levels, vol_slope_levels, jerk_levels, invert, strategy: currentStrategy };
 
             const btn = document.getElementById('apply-filters');
             btn.innerHTML = '⏳ Aplicando...';
@@ -871,7 +1015,11 @@
             document.querySelectorAll('#filter-years input').forEach(c => c.checked = true);
             document.querySelectorAll('#filter-volatility input').forEach(c => c.checked = true);
             document.querySelectorAll('#filter-angles input').forEach(c => c.checked = true);
-            document.querySelectorAll('#filter-dist-sma input').forEach(c => c.checked = true); // New line
+            document.querySelectorAll('#filter-dist-sma input').forEach(c => c.checked = true);
+            document.querySelectorAll('#filter-di input').forEach(c => c.checked = true);
+            document.querySelectorAll('#filter-acc input').forEach(c => c.checked = true);
+            document.querySelectorAll('#filter-vol-slope input').forEach(c => c.checked = true);
+            document.querySelectorAll('#filter-jerk input').forEach(c => c.checked = true);
             document.getElementById('filter-invert').checked = false;
 
             filtersActive = false;
@@ -895,6 +1043,8 @@
                 loadHourChart(suffix),
                 loadHourTable(suffix),
                 loadWeekdayChart(suffix),
+                loadAccChart(suffix),
+                loadAccTable(suffix),
                 loadWeekdayTable(suffix)
             ]);
 
@@ -915,7 +1065,11 @@
                 loadDistChart(suffix),
                 loadDistTable(suffix),
                 loadDiChart(suffix),
-                loadDiTable(suffix)
+                loadDiTable(suffix),
+                loadVolSlopeChart(suffix),
+                loadVolSlopeTable(suffix),
+                loadJerkChart(suffix),
+                loadJerkTable(suffix)
             ]);
         }
 
@@ -1113,6 +1267,175 @@
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
                     <td>${row.di_level}</td>
+                    <td>${row.trades}</td>
+                    <td>${row.win_rate}%</td>
+                    <td style="color: ${getColor(row.total_profit)}">${formatNumber(row.total_profit)}</td>
+                    <td style="color: ${getColor(row.avg_profit)}">${formatNumber(row.avg_profit)}</td>
+                    <td>${row.sharpe_ratio}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function loadVolSlopeChart(suffix) {
+            const data = await fetchData('/api/by_vol_slope' + suffix);
+            const ctx = document.getElementById('volSlopeChart').getContext('2d');
+
+            if (charts.volSlope) charts.volSlope.destroy();
+
+            charts.volSlope = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => d.vol_slope_level),
+                    datasets: [
+                        {
+                            label: 'Lucro Total',
+                            data: data.map(d => d.total_profit),
+                            backgroundColor: data.map(d => d.total_profit >= 0 ? '#3b82f6' : '#ef4444'),
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Win Rate %',
+                            data: data.map(d => d.win_rate),
+                            type: 'line',
+                            borderColor: '#fbbf24',
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    plugins: { title: { display: true, text: 'Inclinação Volume SMA' } },
+                    scales: {
+                        y: { type: 'linear', position: 'left', title: { display: true, text: 'Lucro' } },
+                        y1: { type: 'linear', position: 'right', title: { display: true, text: 'WR%' }, grid: { drawOnChartArea: false } }
+                    }
+                }
+            });
+        }
+
+        async function loadVolSlopeTable(suffix) {
+            const data = await fetchData('/api/by_vol_slope' + suffix);
+            const tbody = document.querySelector('#vol-slope-table tbody');
+            tbody.innerHTML = '';
+
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                     <td>${row.vol_slope_level}</td>
+                     <td>${row.trades}</td>
+                     <td>${row.win_rate}%</td>
+                     <td style="color: ${getColor(row.total_profit)}">${formatNumber(row.total_profit)}</td>
+                     <td style="color: ${getColor(row.avg_profit)}">${formatNumber(row.avg_profit)}</td>
+                     <td>${row.sharpe_ratio}</td>
+                 `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function loadJerkChart(suffix) {
+            const data = await fetchData('/api/by_jerk' + suffix);
+            const ctx = document.getElementById('jerkChart').getContext('2d');
+
+            if (charts.jerk) charts.jerk.destroy();
+
+            charts.jerk = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => d.jerk_level),
+                    datasets: [
+                        {
+                            label: 'Lucro Total',
+                            data: data.map(d => d.total_profit),
+                            backgroundColor: data.map(d => d.total_profit >= 0 ? '#10b981' : '#ef4444'),
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Win Rate %',
+                            data: data.map(d => d.win_rate),
+                            type: 'line',
+                            borderColor: '#e879f9',
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    plugins: { title: { display: true, text: 'Variação Delta T (Jerk)' } },
+                    scales: {
+                        y: { type: 'linear', position: 'left', title: { display: true, text: 'Lucro' } },
+                        y1: { type: 'linear', position: 'right', title: { display: true, text: 'WR%' }, grid: { drawOnChartArea: false } }
+                    }
+                }
+            });
+        }
+
+        async function loadJerkTable(suffix) {
+            const data = await fetchData('/api/by_jerk' + suffix);
+            const tbody = document.querySelector('#jerk-table tbody');
+            tbody.innerHTML = '';
+
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                      <td>${row.jerk_level}</td>
+                      <td>${row.trades}</td>
+                      <td>${row.win_rate}%</td>
+                      <td style="color: ${getColor(row.total_profit)}">${formatNumber(row.total_profit)}</td>
+                      <td style="color: ${getColor(row.avg_profit)}">${formatNumber(row.avg_profit)}</td>
+                      <td>${row.sharpe_ratio}</td>
+                  `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        async function loadAccChart(suffix) {
+            const data = await fetchData('/api/by_acc' + suffix);
+            const ctx = document.getElementById('accChart').getContext('2d');
+
+            if (charts.acc) charts.acc.destroy();
+
+            charts.acc = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: data.map(d => d.acc_level),
+                    datasets: [
+                        {
+                            label: 'Lucro Total',
+                            data: data.map(d => d.total_profit),
+                            backgroundColor: data.map(d => d.total_profit >= 0 ? '#8b5cf6' : '#ef4444'),
+                            yAxisID: 'y'
+                        },
+                        {
+                            label: 'Win Rate %',
+                            data: data.map(d => d.win_rate),
+                            type: 'line',
+                            borderColor: '#e879f9',
+                            tension: 0.4,
+                            yAxisID: 'y1'
+                        }
+                    ]
+                },
+                options: {
+                    responsive: true,
+                    plugins: { title: { display: true, text: 'Aceleração Delta T' } },
+                    scales: {
+                        y: { type: 'linear', position: 'left', title: { display: true, text: 'Lucro Total' } },
+                        y1: { type: 'linear', position: 'right', title: { display: true, text: 'Win Rate %' }, grid: { drawOnChartArea: false } }
+                    }
+                }
+            });
+        }
+
+        async function loadAccTable(suffix) {
+            const data = await fetchData('/api/by_acc' + suffix);
+            const tbody = document.querySelector('#acc-table tbody');
+            tbody.innerHTML = '';
+
+            data.forEach(row => {
+                const tr = document.createElement('tr');
+                tr.innerHTML = `
+                    <td>${row.acc_level}</td>
                     <td>${row.trades}</td>
                     <td>${row.win_rate}%</td>
                     <td style="color: ${getColor(row.total_profit)}">${formatNumber(row.total_profit)}</td>
@@ -1487,15 +1810,21 @@
                 document.getElementById('deselect-all-btn').addEventListener('click', deselectAllStrategies);
                 document.getElementById('export-strategies-btn').addEventListener('click', exportSelectedStrategies);
                 document.getElementById('import-strategy-file').addEventListener('change', importStrategy);
+                document.getElementById('export-strategies-btn').addEventListener('click', exportSelectedStrategies);
+                document.getElementById('import-strategy-file').addEventListener('change', importStrategy);
+
+                // Initialize Code Tabs
+                initTabs();
             }
         });
 
         // ============== STRATEGY MANAGEMENT FUNCTIONS ==============
 
-        async function loadStrategiesList() {
+        async function loadStrategiesList(strategyType = null) {
             try {
-                console.log('Iniciando loadStrategiesList...');
-                const strategies = await fetchData('/api/strategies');
+                console.log('Iniciando loadStrategiesList...', strategyType);
+                const url = strategyType ? `/api/strategies?strategy=${strategyType}` : '/api/strategies';
+                const strategies = await fetchData(url);
                 console.log('Estratégias recebidas:', strategies);
 
                 const listDiv = document.getElementById('strategies-list');
@@ -1621,6 +1950,9 @@
                 angle_ranges: Array.from(document.querySelectorAll('#filter-angles input:checked')).map(c => c.value),
                 dist_levels: Array.from(document.querySelectorAll('#filter-dist-sma input:checked')).map(c => c.value),
                 di_levels: Array.from(document.querySelectorAll('#filter-di input:checked')).map(c => c.value),
+                acc_levels: Array.from(document.querySelectorAll('#filter-acc input:checked')).map(c => c.value),
+                vol_slope_levels: Array.from(document.querySelectorAll('#filter-vol-slope input:checked')).map(c => c.value),
+                jerk_levels: Array.from(document.querySelectorAll('#filter-jerk input:checked')).map(c => c.value),
                 invert: document.getElementById('filter-invert').checked
             };
         }
@@ -1644,7 +1976,7 @@
                 if (result.status === 'ok') {
                     statusDiv.innerHTML = '<span style="color: #10b981;">✅ Estratégia salva com sucesso!</span>';
                     nameInput.value = '';
-                    await loadStrategiesList();
+                    await loadStrategiesList(currentStrategy);
                 } else {
                     statusDiv.innerHTML = '<span style="color: #ef4444;">❌ Erro ao salvar</span>';
                 }
@@ -1676,9 +2008,13 @@
                 document.querySelectorAll('#filter-volatility input').forEach(c => c.checked = !f.volatility || f.volatility.includes(c.value));
                 document.querySelectorAll('#filter-angles input').forEach(c => c.checked = !f.angle_ranges || f.angle_ranges.includes(c.value));
                 document.querySelectorAll('#filter-dist-sma input').forEach(c => c.checked = !f.dist_levels || f.dist_levels.includes(c.value));
+                document.querySelectorAll('#filter-di input').forEach(c => c.checked = !f.di_levels || f.di_levels.includes(c.value));
+                document.querySelectorAll('#filter-acc input').forEach(c => c.checked = !f.acc_levels || f.acc_levels.includes(c.value));
+                document.querySelectorAll('#filter-vol-slope input').forEach(c => c.checked = !f.vol_slope_levels || f.vol_slope_levels.includes(c.value));
+                document.querySelectorAll('#filter-jerk input').forEach(c => c.checked = !f.jerk_levels || f.jerk_levels.includes(c.value));
 
                 await applyFilters();
-                statusDiv.innerHTML = `< span style = "color: #10b981;" >✅ Estratégia "${strategy.name}" aplicada!</span > `;
+                statusDiv.innerHTML = `<span style="color: #10b981;">✅ Estratégia "${strategy.name}" aplicada!</span>`;
             } catch (e) {
                 statusDiv.innerHTML = '<span style="color: #ef4444;">❌ Erro ao carregar: ' + e.message + '</span>';
             }
@@ -1810,17 +2146,7 @@
             if (!confirmed) return;
 
             const name = document.getElementById('strategy-name').value.trim() || originalName;
-
-            const direction = document.getElementById('filter-direction').value;
-            const hours = Array.from(document.querySelectorAll('#filter-hours input:checked')).map(c => parseInt(c.value));
-            const weekdays = Array.from(document.querySelectorAll('#filter-weekdays input:checked')).map(c => parseInt(c.value));
-            const years = Array.from(document.querySelectorAll('#filter-years input:checked')).map(c => parseInt(c.value));
-            const volatility = Array.from(document.querySelectorAll('#filter-volatility input:checked')).map(c => c.value);
-            const angles = Array.from(document.querySelectorAll('#filter-angles input:checked')).map(c => c.value);
-            const dist_levels = Array.from(document.querySelectorAll('#filter-dist-sma input:checked')).map(c => c.value);
-            const invert = document.getElementById('filter-invert').checked;
-
-            const filters = { direction, hours, weekdays, years, volatility, angle_ranges: angles, dist_levels, invert };
+            const filters = getCurrentFilters();
             const ratioLabel = document.getElementById('ratio-selector').value;
 
             try {
@@ -1956,6 +2282,63 @@
             }
         }
 
+        // Função de troca de abas (Restored)
+        function switchTab(tabId) {
+            // Se for overview, tratamento especial
+            if (tabId === 'tab-overview') {
+                showOverviewPage();
+                return;
+            }
+
+            // Normal tabs (strategies)
+            hideOverviewPage();
+
+            // Remove active class from all tabs
+            document.querySelectorAll('.nav-tab').forEach(t => {
+                t.classList.remove('active');
+                if (t.id === 'tab-overview') {
+                    t.style.background = 'transparent';
+                    t.style.color = '#94a3b8';
+                }
+            });
+
+            // Add active class to clicked tab
+            const tab = document.getElementById(tabId);
+            if (tab) tab.classList.add('active');
+
+            // Show corresponding strategy rules
+            document.querySelectorAll('.strategy-conditions').forEach(c => c.style.display = 'none');
+
+            // Map tabId back to strategy key
+            // tabId format: 'tab-' + strategy_key
+            const strategyKey = tabId.replace('tab-', '');
+            const ruleDiv = document.getElementById('rules-' + strategyKey);
+            if (ruleDiv) ruleDiv.style.display = 'block';
+
+            // Set current strategy global
+            currentStrategy = strategyKey;
+
+            // Trigger data refresh without full reload if possible, otherwise reload
+            // But we actually need to check if data is ready for this strategy? 
+            // The waitForData/refreshAllData handles 'currentStrategy'.
+
+            // Reset filters logic for new strategy? Or keep filters?
+            // Usually keep filters but re-apply them to new strategy data.
+            // Let's just refresh.
+            // Let's just refresh.
+            refreshAllData();
+            loadStrategiesList(strategyKey);
+        }
+
+        // Initialize Tabs Listeners
+        function initTabs() {
+            document.querySelectorAll('.nav-tab').forEach(button => {
+                button.addEventListener('click', () => {
+                    switchTab(button.id);
+                });
+            });
+        }
+
         function hideOverviewPage() {
             // Hide overview
             document.getElementById('overview-page').style.display = 'none';
@@ -1975,6 +2358,7 @@
         function selectStrategy(strategyName) {
             currentStrategy = strategyName;
             hideOverviewPage();
+            loadStrategiesList(strategyName);
         }
 
         async function loadOverviewData() {

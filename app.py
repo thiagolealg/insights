@@ -21,14 +21,17 @@ AVAILABLE_STRATEGIES = {
     'bull_bear_bear': 'Alta-Baixa-Baixa (PB Duplo)',
     'sequence_reversal': 'Sequência Reversão (6 Bulls 3 Bears)',
     'sma_trend': 'Tendência SMA (Venda)',
-    'std_reversal': 'Reversão Desvio Padrão (Nova)'
+    'std_reversal': 'Reversão Desvio Padrão (Nova)',
+    'sma_pullback': 'Pullback SMA (i-5)',
+    'three_soldiers': 'Três Soldados (Alta-Baixa)',
+    'breakout_momentum': 'Breakout Momentum (Corpo 3x)'
 }
 
 # Inicializa o status de todas as estratégias como 'loading'
 analyzers_status = {strategy_type: 'loading' for strategy_type in AVAILABLE_STRATEGIES.keys()}
 analyzers_errors = {strategy_type: None for strategy_type in AVAILABLE_STRATEGIES.keys()}
 
-DATA_FILE = "attached_assets/win_1767085916180.txt"
+DATA_FILE = "win_full_data.parquet"
 
 def load_strategy_instance(strategy_type):
     global analyzers, analyzers_status, analyzers_errors
@@ -154,6 +157,27 @@ def get_by_di():
     use_filtered = request.args.get('filtered', 'false').lower() == 'true'
     return jsonify(a.get_stats_by_di(use_filtered))
 
+@app.route('/api/by_acc')
+def get_by_acc():
+    a = get_active_analyzer_instance()
+    if not a: return jsonify({'error': 'Strategy not ready'}), 503
+    use_filtered = request.args.get('filtered', 'false').lower() == 'true'
+    return jsonify(a.get_stats_by_acc(use_filtered))
+
+@app.route('/api/by_vol_slope')
+def get_by_vol_slope():
+    a = get_active_analyzer_instance()
+    if not a: return jsonify({'error': 'Strategy not ready'}), 503
+    use_filtered = request.args.get('filtered', 'false').lower() == 'true'
+    return jsonify(a.get_stats_by_vol_slope(use_filtered))
+
+@app.route('/api/by_jerk')
+def get_by_jerk():
+    a = get_active_analyzer_instance()
+    if not a: return jsonify({'error': 'Strategy not ready'}), 503
+    use_filtered = request.args.get('filtered', 'false').lower() == 'true'
+    return jsonify(a.get_stats_by_jerk(use_filtered))
+
 @app.route('/api/by_take_stop')
 def get_by_take_stop():
     a = get_active_analyzer_instance()
@@ -258,21 +282,39 @@ import uuid
 from flask import Response
 
 STRATEGIES_FILE = 'saved_strategies.json'
+STRATEGIES_CACHE = None
+STRATEGIES_CACHE_MTIME = 0
 
 def load_strategies():
-    """Load saved strategies from file"""
+    """Load saved strategies from file with caching"""
+    global STRATEGIES_CACHE, STRATEGIES_CACHE_MTIME
+    
     if os.path.exists(STRATEGIES_FILE):
         try:
-            with open(STRATEGIES_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
+            mtime = os.path.getmtime(STRATEGIES_FILE)
+            if STRATEGIES_CACHE is None or mtime > STRATEGIES_CACHE_MTIME:
+                print(f"Loading strategies from disk (mtime: {mtime})...")
+                with open(STRATEGIES_FILE, 'r', encoding='utf-8') as f:
+                    STRATEGIES_CACHE = json.load(f)
+                STRATEGIES_CACHE_MTIME = mtime
+            return STRATEGIES_CACHE
+        except Exception as e:
+            print(f"Error loading strategies: {e}")
             return []
     return []
 
 def save_strategies(strategies):
-    """Save strategies to file"""
-    with open(STRATEGIES_FILE, 'w', encoding='utf-8') as f:
-        json.dump(strategies, f, ensure_ascii=False, indent=2)
+    """Save strategies to file and update cache"""
+    global STRATEGIES_CACHE, STRATEGIES_CACHE_MTIME
+    try:
+        with open(STRATEGIES_FILE, 'w', encoding='utf-8') as f:
+            json.dump(strategies, f, ensure_ascii=False, indent=2)
+        
+        # Update cache immediately
+        STRATEGIES_CACHE = strategies
+        STRATEGIES_CACHE_MTIME = os.path.getmtime(STRATEGIES_FILE)
+    except Exception as e:
+        print(f"Error saving strategies: {e}")
 
 @app.route('/api/strategies', methods=['GET'])
 def list_strategies():
